@@ -1,0 +1,220 @@
+---
+name: finish-rollout
+description: "Closes out a production multisig rollout once its timelock ops executed: verifies execution, replies Executed in the #dev-sc-multisig-proposals thread and, in deploy mode, syncs diamond logs and _targetState.json onto the rollout PR and posts it for review. Use for \"finish the rollout\" or a thread link. Tail of multisig-rollout."
+usage: /finish-rollout <slack thread link>
+---
+
+# Finish Rollout
+
+The tail of `multisig-rollout`, which ends at "timelock ops execute via the scheduled
+pipeline". Direct execution stays with the workflow / `execute-pending-timelock-tx.ts`.
+
+Input: a `#dev-sc-multisig-proposals` thread link, e.g.
+`https://lifi-protocol.slack.com/archives/C09DKGYQ1GC/p1783082088092039`.
+Channel id is the `C…` path segment; the parent message `ts` comes from the `p<digits>` segment
+by inserting a `.` before the last 6 digits (`p1783082088092039` → `1783082088.092039`).
+
+## Hard rails
+
+- **Strict finisher.** Never execute, cancel, or reschedule timelock ops directly. The one
+  allowed nudge: when this rollout's ops are ready-but-unexecuted, dispatch the Timelock Auto
+  Execution workflow (Phase 2b) — the same pipeline the cron uses — and wait for it. Every
+  other stuck state (missing signatures, delay still running) is report-and-stop.
+- **Nothing outward-facing before the gate passes.** No Slack reply, no reaction, no PR
+  mutation until Phase 2 verifies every op of THIS rollout as executed (all-or-nothing).
+- **Op-level scope.** The gate covers only ops correlated to this rollout. Unrelated
+  queued/unexecuted ops on the same networks are never stoppers (mention as FYI at most).
+- **No lifi-connect tunnel.** Verification uses the non-gated `MONGODB_URI` timelock queue plus public RPCs.
+  Do not call `list-pending-proposals.ts` (lifi-connect-gated `SC_MONGODB_URI`) as part of this skill.
+- **Hands off `.env`.** Never read, grep, `ls` or `test` it: it is deny-listed, so a refused
+  command proves nothing about the file. The Phase 2 script loads `.env` itself.
+- The thread must live in `#dev-sc-multisig-proposals` (`C09DKGYQ1GC`). Anything else: stop
+  and ask.
+
+## Phase 0 — Preflight
+
+- Slack MCP connected (read thread, send reply, add reaction). If missing, stop — the Slack
+  closure is half the job.
+- `gh auth status` OK (deploy mode edits the rollout PR).
+
+## Phase 1 — Parse the thread
+
+Read the thread. Extract:
+
+- **Mode** from the top-level message: `<N>x <Contract> v<version> deployment` → deploy mode;
+  `<N>x whitelist sync — …` → whitelist mode. Neither → stop and ask.
+- **Networks** from the reply's `Safe proposals live on:` bullets (ignore trailing
+  `(nonce N)` annotations).
+- **PR URL** from the reply (`PR with deployed addresses:` / `Whitelist PR:`). A thread posted by
+  `multisig-rollout` always carries this link; if it's absent (thread posted by hand, or edited),
+  stop and ask the user for the rollout PR URL rather than guessing from recent merges.
+- **Parent `ts`** for the reaction, thread `ts` for the reply.
+
+## Phase 2 — Verification gate (all-or-nothing, op-level)
+
+Correlate queue rows to this rollout by **deployed address in the scheduled payload**:
+
+1. Per network, get the rollout's contract address:
+   - deploy mode: the PR's `| Chain | Contract address | … |` table, or the
+     `deployments/<net>.json` diff in the PR.
+   - whitelist mode: the added/removed addresses from the whitelist PR's
+     `config/whitelist.json` diff.
+   - Tron (`tron`/`tronshasta`): `--payloadContains` matches hex only, so a base58 `T…`
+     address matches nothing. Convert first:
+     `bun troncast address to-hex <base58 csv>` → `0x…` csv to pass as-is.
+2. Run:
+
+   ```bash
+   bunx tsx script/deploy/safe/list-timelock-queue.ts \
+     --network <csv> --payloadContains <address csv> --checkOnChain --json
+   ```
+
+   Exit codes: `0` ok, `1` real error (stop, report), `2` `MONGODB_URI` missing/unreachable
+   (re-run once; still `2` → relay the script's error verbatim and stop, without guessing at
+   `.env`).
+3. **Gate**: every target network has ≥1 correlated row, and every correlated row is
+   `status: "executed"` with `onChainDone: true`. A diamond-called periphery rollout expects
+   **two** rows per network (registration + whitelist).
+4. When the gate fails, branch on the per-row state:
+   - row `queued`, `onChainReady: true` → executable now, the cron just hasn't run →
+     **Phase 2b** (trigger execution), then continue;
+   - anything else → print a per-network stuck-state table and STOP:
+     - no correlated row → the Safe tx was never executed on-chain (queue rows are written by
+       `confirm-safe-tx.ts` when it mines) → still gathering signatures;
+     - row `queued`, `onChainReady: false` → timelock delay still running;
+     - row `cancelled`/`failed` → surface `failureReason` and ask the user how to proceed.
+
+### Phase 2b — Trigger execution (ready-but-unexecuted ops only)
+
+Dispatch the same pipeline the cron uses (requires repo write access; a dispatched run always
+executes, even when scheduled runs are disabled):
+
+```bash
+gh workflow run runPendingTimelockTXs.yml --repo lifinance/contracts
+```
+
+The new run takes a few seconds to appear; poll until the newest `workflow_dispatch` run's
+`createdAt` is after your dispatch, then watch it (it may first queue behind an in-flight cron
+run — the concurrency group serializes them):
+
+```bash
+RUN_ID=$(gh run list --repo lifinance/contracts --workflow runPendingTimelockTXs.yml \
+  --event workflow_dispatch --limit 1 --json databaseId,createdAt --jq '.[0].databaseId')
+gh run watch "$RUN_ID" --repo lifinance/contracts --exit-status
+```
+
+Afterwards re-run the Phase 2 gate **once**. Green → continue to Phase 3. Still not executed →
+`gh run view "$RUN_ID" --repo lifinance/contracts --log-failed`, report, STOP — never loop
+dispatches.
+
+## Phase 3 — Slack closure
+
+Reply in the thread with exactly `Executed`, then add the `rocket` reaction to the parent
+message. Both via the Slack MCP tools; if unavailable, hand the user the exact reply text and
+emoji to post manually — do not use webhooks.
+
+## Phase 4 — Diamond log and target-state sync (deploy mode only)
+
+The production `deployments/<net>.diamond.json` registry only updates when the cut executes —
+that's now. Regenerate it from on-chain state:
+
+```bash
+gh pr checkout <N>
+git fetch origin main
+git merge origin/main
+./script/tasks/updateDiamondLogs.sh production <network> [<network>...]
+```
+
+The merge brings in any network or pin `main` added to `_targetState.json` since the rollout PR
+branched. The target-state step below refuses to run on a branch that does not contain a
+freshly fetched `origin/main`. If the merge conflicts, resolve it before going further, and
+never resolve a `_targetState.json` hunk by dropping `main`'s side.
+
+Run each as its own plain command from the repo root — no `&&`, pipes, `bash -c` or `source`.
+In a worktree-isolated session Claude Code refuses any command whose git behavior it can't
+read from the command text, and sourcing `script/helperFunctions.sh` inline is one of them.
+The script sources the helpers itself (under bash, so zsh bashism failures don't apply).
+
+The diff MUST show the new contract/version in each impacted `<net>.diamond.json` — this is a
+second, independent execution proof. If it doesn't, that contradicts Phase 2: stop, flag,
+investigate; commit nothing.
+
+Then declare the rollout in `script/deploy/_targetState.json`, for the networks whose
+regenerated diamond log shows the contract. That is the deploy networks, not the extra
+chainId-mapping networks a PolymerCCTP/Frax rollout lists in the thread:
+
+```bash
+bunx tsx script/tasks/declareRolloutInTargetState.ts --contract <Contract> --version <version> --networks <csv>
+```
+
+It adds a missing entry as `"latest"` and leaves `"latest"` and a matching pin alone. On exit
+`1` it has written nothing. It refuses the whole run when `--contract` is not a contract
+name or the branch does not contain `origin/main`. Act on each refused network:
+
+- `not-in-diamond-log`: the regenerated `deployments/<net>.diamond.json` does not list the
+  contract (a periphery contract by name; a facet by name at `--version`). Either the name or
+  version is wrong, the network is not one the cut reached, or the log was not regenerated.
+  Fix the argument or drop the network; never edit the diamond log to make it pass.
+- `network-not-declared`: the network was never seeded (`/add-network` owns that). Stop and
+  report it. Do not create a one-contract network block.
+- `pin-conflict`: a pin other than the executed version. A pin is a deliberate decision, so
+  ask the user whether the hold-back is over. If it is, re-run with `--unpin`, which rewrites
+  it to `"latest"`. If not, leave the pin and drop that network from `--networks`.
+
+Commit the diamond-log diff and any `_targetState.json` diff to the PR branch together, then
+push.
+
+**Removals in the same cut.** `updateDiamondLogs` rebuilds `Facets` from the loupe, so a facet
+the cut removed (a drained deferred-cleanup task rides along as extra `scheduleBatch` elements)
+disappears from `<net>.diamond.json` on its own — but the flat `deployments/<net>.json` is
+append-only. Delete each removed facet's entry there by hand in the same commit; both logs track
+current on-chain registration, not history
+([docs/DeploymentLogs.md](../../docs/DeploymentLogs.md)). Keep the entry when the facet is still
+routed by the loupe and no open parked task covers it (removal not executed, or the parked task
+retired as cancelled — cancellation proves nothing about routing). An entry already pruned at
+park time stays pruned while its task is still `queued`/`proposed` — the queue-aware
+invariants track the still-routed facet as expected-pending. Restore it if the task retired as
+cancelled and the loupe still routes the facet. `superseded` is loupe-verified gone, so
+delete that entry with the rest of the cut.
+
+A facet the cut's own `FacetCut[]` removed (e.g. `AcrossFacetV3` replaced by `AcrossFacetV4`)
+also loses its key in that network's `production.LiFiDiamond` block of `_targetState.json`, by
+hand in the same commit. Otherwise healthCheck's `facets-registered` and
+`non-core-facets-deployed` invariants expect it back once the PR merges. A drained
+deferred-cleanup removal needs no edit: it was only queued because target state no longer
+declared it.
+
+## Phase 5 — PR finish (deploy mode only)
+
+1. Self-review the full diff (the local review gate — resolve findings first).
+2. `gh pr ready <N>` (draft → ready for review).
+3. `/post-pr-for-review` (posts to `#dev-sc-review`, tags the team, enables auto-merge).
+
+Whitelist mode skips Phases 4–5: its PR was merged before the rollout started.
+
+## Phase 6 — Report
+
+Networks with their `executionTxHash`es, Slack reply + reaction confirmation, target-state
+outcome per network (added / already declared / unpinned / left pinned), PR state
+(commit pushed, ready, posted for review), and any FYI (e.g. unrelated ops still queued on the
+same networks).
+
+## Failure modes
+
+- `list-timelock-queue.ts` exit `2` twice in a row → `MONGODB_URI` missing or cluster
+  unreachable — relay the error verbatim, stop.
+- A correlated row is `status: "blocked"` → the pre-execute guard refused the batch and the
+  timelock op is still un-executed. The gate fails; do not treat it as done. **Report and
+  stop** — clearing a block is outside the finisher's authority (Hard rails: the workflow
+  dispatch is the only allowed nudge). Re-run the lister with `--attention`, relay
+  `statusReason` and whether the op is still executable on-chain, and hand it to an approved
+  operator: they clear the cause and run `requeue-timelock-op.ts` themselves, or — for a
+  fully-obsolete folded removal — cancel the op and re-propose the primary cut alone (see
+  `docs/DeferredDiamondCleanupQueue.md`).
+- Thread doesn't parse (format drift, missing PR link) → show what was extracted, ask.
+- PR already merged/closed in deploy mode → nothing to finish there; report and continue with
+  the Slack closure only if the gate passed.
+- Diamond log diff missing the expected version → contradiction with the queue; stop and
+  investigate (wrong address correlated, or the cut executed a different payload).
+- `gh workflow run` fails in Phase 2b → the user's `gh` account lacks write access to
+  `lifinance/contracts`; relay and stop (the cron will pick the ops up on its own).

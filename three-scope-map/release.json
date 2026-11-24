@@ -1,0 +1,13 @@
+{
+  "version": "3.0.0",
+  "status": "release",
+  "templateFiles": {
+    "classic": 63,
+    "fui": 156
+  },
+  "source": {
+    "algorithm": "sha256-path-content-v1",
+    "sha256": "112c5064bfe6d5b63c9b60244e44494d3023a69e5300d674bad95a89193f039b",
+    "files": 323
+  }
+}
